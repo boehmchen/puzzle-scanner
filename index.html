@@ -351,8 +351,9 @@ async function startCamera() {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: 'environment',
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        focusMode: { ideal: 'continuous' }
       }
     });
     video.srcObject = stream;
@@ -364,6 +365,32 @@ async function startCamera() {
     loadingText.textContent = 'Camera access denied. Please allow camera.';
     console.error(err);
   }
+}
+
+// --- Persistent OpenCV objects (created once, reused every frame) ---
+let arucoDict = null;
+let arucoParams = null;
+let cap = null;
+let srcMat = null;
+let grayMat = null;
+
+function initDetector() {
+  arucoDict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_1000);
+  arucoParams = new cv.aruco.DetectorParameters();
+
+  // Tune for phone cameras
+  arucoParams.adaptiveThreshWinSizeMin = 3;
+  arucoParams.adaptiveThreshWinSizeMax = 30;
+  arucoParams.adaptiveThreshWinSizeStep = 5;
+  arucoParams.adaptiveThreshConstant = 7;
+  arucoParams.minMarkerPerimeterRate = 0.01;
+  arucoParams.maxMarkerPerimeterRate = 4.0;
+  arucoParams.polygonalApproxAccuracyRate = 0.05;
+  arucoParams.minCornerDistanceRate = 0.05;
+  arucoParams.minDistanceToBorder = 1;
+  arucoParams.cornerRefinementMethod = cv.aruco.CORNER_REFINE_SUBPIX;
+
+  cap = new cv.VideoCapture(video);
 }
 
 // --- OpenCV detection loop ---
@@ -379,21 +406,27 @@ function detectMarkers() {
   if (canvasOverlay.width !== w) canvasOverlay.width = w;
   if (canvasOverlay.height !== h) canvasOverlay.height = h;
 
-  let src;
+  // Allocate persistent mats on first frame or if resolution changes
+  if (!srcMat || srcMat.rows !== h || srcMat.cols !== w) {
+    if (srcMat) srcMat.delete();
+    if (grayMat) grayMat.delete();
+    srcMat = new cv.Mat(h, w, cv.CV_8UC4);
+    grayMat = new cv.Mat();
+  }
+
+  const corners = new cv.MatVector();
+  const ids = new cv.Mat();
+
   try {
-    src = new cv.Mat(h, w, cv.CV_8UC4);
-    const cap = new cv.VideoCapture(video);
-    cap.read(src);
+    cap.read(srcMat);
+    cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
 
-    const gray = new cv.Mat();
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    // Enhance contrast with CLAHE for better detection in varying lighting
+    const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+    clahe.apply(grayMat, grayMat);
+    clahe.delete();
 
-    const corners = new cv.MatVector();
-    const ids = new cv.Mat();
-    const dict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_1000);
-    const params = new cv.aruco.DetectorParameters();
-
-    cv.aruco.detectMarkers(gray, dict, corners, ids, params);
+    cv.aruco.detectMarkers(grayMat, arucoDict, corners, ids, arucoParams);
 
     // Clear overlay
     ctx.clearRect(0, 0, w, h);
@@ -417,10 +450,6 @@ function detectMarkers() {
         });
       }
 
-      // Scale overlay to CSS size
-      const sx = canvasOverlay.clientWidth / w;
-      const sy = canvasOverlay.clientHeight / h;
-
       const isTarget = targetCode.length === 2 && markerId === targetId;
 
       // Draw outline
@@ -439,7 +468,6 @@ function detectMarkers() {
 
       // Draw code label
       const cx = (pts[0].x + pts[2].x) / 2;
-      const cy = (pts[0].y + pts[2].y) / 2;
       const fontSize = Math.max(14, Math.abs(pts[1].x - pts[0].x) * 0.5);
 
       ctx.font = `bold ${fontSize}px 'JetBrains Mono', monospace`;
@@ -488,15 +516,12 @@ function detectMarkers() {
 
     detectCountEl.textContent = `${numMarkers} detected`;
     totalScannedEl.textContent = `${totalScanned.size} scanned`;
-
-    gray.delete();
-    corners.delete();
-    ids.delete();
-    src.delete();
   } catch (e) {
-    if (src) src.delete();
-    console.error(e);
+    console.error('Detection error:', e);
   }
+
+  corners.delete();
+  ids.delete();
 
   requestAnimationFrame(detectMarkers);
 }
@@ -523,6 +548,7 @@ function updateDetectedUI(detected) {
 // --- Load OpenCV.js ---
 function onOpenCvReady() {
   cvReady = true;
+  initDetector();
   statusDot.classList.add('ready');
   loadingOverlay.classList.add('hidden');
   detectMarkers();
