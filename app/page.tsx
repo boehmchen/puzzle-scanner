@@ -7,6 +7,8 @@ const ALPHABET = "123456789ABCDEFGHJKLMNPQRTUVWXYZ".split("");
 const CHAR_TO_IDX: Record<string, number> = {};
 ALPHABET.forEach((c, i) => (CHAR_TO_IDX[c] = i));
 
+const DETECT_MAX_WIDTH = 960;
+
 function idToCode(id: number): string {
   if (id < 0 || id >= 1024) return "??";
   return ALPHABET[Math.floor(id / 32)] + ALPHABET[id % 32];
@@ -22,60 +24,30 @@ function codeToId(code: string): number {
 
 type Detected = { id: number; code: string };
 
+type ArMarker = { id: number; corners: { x: number; y: number }[] };
+type ArDetector = {
+  detectImage: (w: number, h: number, data: Uint8ClampedArray) => ArMarker[];
+};
+type ArGlobal = {
+  Detector: new (config: { dictionaryName: string }) => ArDetector;
+};
+
 declare global {
   interface Window {
-    cv?: CvGlobal;
+    AR?: ArGlobal;
   }
 }
 
-type CvMat = {
-  rows: number;
-  cols: number;
-  intAt: (r: number, c: number) => number;
-  floatAt: (r: number, c: number) => number;
-  delete: () => void;
-};
-type CvMatVector = { get: (i: number) => CvMat; delete: () => void };
-type ArucoParams = {
-  adaptiveThreshWinSizeMin: number;
-  adaptiveThreshWinSizeMax: number;
-  adaptiveThreshWinSizeStep: number;
-  adaptiveThreshConstant: number;
-  minMarkerPerimeterRate: number;
-  maxMarkerPerimeterRate: number;
-  polygonalApproxAccuracyRate: number;
-  minCornerDistanceRate: number;
-  minDistanceToBorder: number;
-  cornerRefinementMethod: number;
-};
-type CvGlobal = {
-  aruco: {
-    getPredefinedDictionary: (n: number) => unknown;
-    DICT_4X4_1000: number;
-    DetectorParameters: new () => ArucoParams;
-    CORNER_REFINE_SUBPIX: number;
-    detectMarkers: (
-      gray: CvMat,
-      dict: unknown,
-      corners: CvMatVector,
-      ids: CvMat,
-      params: ArucoParams,
-    ) => void;
-  };
-  Mat: new (rows?: number, cols?: number, type?: number) => CvMat;
-  MatVector: new () => CvMatVector;
-  Size: new (w: number, h: number) => unknown;
-  CLAHE: new (
-    clip: number,
-    tileSize: unknown,
-  ) => { apply: (src: CvMat, dst: CvMat) => void; delete: () => void };
-  VideoCapture: new (v: HTMLVideoElement) => { read: (mat: CvMat) => void };
-  cvtColor: (src: CvMat, dst: CvMat, code: number) => void;
-  COLOR_RGBA2GRAY: number;
-  CV_8UC4: number;
-  getBuildInformation?: () => string;
-  onRuntimeInitialized?: () => void;
-};
+function loadScript(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -87,7 +59,7 @@ export default function Home() {
   const [totalScanned, setTotalScanned] = useState(0);
   const [fps, setFps] = useState(0);
   const [ready, setReady] = useState(false);
-  const [loadingText, setLoadingText] = useState("Loading OpenCV.js...");
+  const [loadingText, setLoadingText] = useState("Loading detector...");
   const [foundActive, setFoundActive] = useState(false);
 
   const targetIdRef = useRef(-1);
@@ -108,87 +80,54 @@ export default function Home() {
 
     let cancelled = false;
     let rafId = 0;
-    let arucoDict: unknown = null;
-    let arucoParams: ArucoParams | null = null;
-    let cap: { read: (mat: CvMat) => void } | null = null;
-    let srcMat: CvMat | null = null;
-    let grayMat: CvMat | null = null;
+    let detector: ArDetector | null = null;
+    const detectCanvas = document.createElement("canvas");
+    const detectCtx = detectCanvas.getContext("2d", {
+      willReadFrequently: true,
+    })!;
     let frameCount = 0;
     let lastFpsTime = performance.now();
 
-    const initDetector = () => {
-      const cv = window.cv!;
-      arucoDict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_1000);
-      arucoParams = new cv.aruco.DetectorParameters();
-      arucoParams.adaptiveThreshWinSizeMin = 3;
-      arucoParams.adaptiveThreshWinSizeMax = 30;
-      arucoParams.adaptiveThreshWinSizeStep = 5;
-      arucoParams.adaptiveThreshConstant = 7;
-      arucoParams.minMarkerPerimeterRate = 0.01;
-      arucoParams.maxMarkerPerimeterRate = 4.0;
-      arucoParams.polygonalApproxAccuracyRate = 0.05;
-      arucoParams.minCornerDistanceRate = 0.05;
-      arucoParams.minDistanceToBorder = 1;
-      arucoParams.cornerRefinementMethod = cv.aruco.CORNER_REFINE_SUBPIX;
-      cap = new cv.VideoCapture(video);
-    };
-
     const detectLoop = () => {
       if (cancelled) return;
-      if (!window.cv || video.readyState < 2) {
+      if (!detector || video.readyState < 2) {
         rafId = requestAnimationFrame(detectLoop);
         return;
       }
-      const cv = window.cv;
-      const w = video.videoWidth;
-      const h = video.videoHeight;
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
 
-      if (!srcMat || srcMat.rows !== h || srcMat.cols !== w) {
-        srcMat?.delete();
-        grayMat?.delete();
-        srcMat = new cv.Mat(h, w, cv.CV_8UC4);
-        grayMat = new cv.Mat();
-      }
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (canvas.width !== vw) canvas.width = vw;
+      if (canvas.height !== vh) canvas.height = vh;
 
-      const corners = new cv.MatVector();
-      const ids = new cv.Mat();
+      const scale = vw > DETECT_MAX_WIDTH ? DETECT_MAX_WIDTH / vw : 1;
+      const dw = Math.round(vw * scale);
+      const dh = Math.round(vh * scale);
+      if (detectCanvas.width !== dw) detectCanvas.width = dw;
+      if (detectCanvas.height !== dh) detectCanvas.height = dh;
 
       try {
-        cap!.read(srcMat);
-        cv.cvtColor(srcMat, grayMat!, cv.COLOR_RGBA2GRAY);
-        const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
-        clahe.apply(grayMat!, grayMat!);
-        clahe.delete();
-        cv.aruco.detectMarkers(
-          grayMat!,
-          arucoDict,
-          corners,
-          ids,
-          arucoParams!,
-        );
+        detectCtx.drawImage(video, 0, 0, dw, dh);
+        const img = detectCtx.getImageData(0, 0, dw, dh);
+        const markers = detector.detectImage(dw, dh, img.data);
 
-        ctx.clearRect(0, 0, w, h);
+        ctx.clearRect(0, 0, vw, vh);
 
         const frameDetected: Detected[] = [];
-        const numMarkers = ids.rows;
         const targetId = targetIdRef.current;
         const target = targetCodeRef.current;
+        const invScale = 1 / scale;
 
-        for (let i = 0; i < numMarkers; i++) {
-          const markerId = ids.intAt(i, 0);
-          const code = idToCode(markerId);
-          frameDetected.push({ id: markerId, code });
-          scannedSetRef.current.add(markerId);
+        for (const m of markers) {
+          const code = idToCode(m.id);
+          frameDetected.push({ id: m.id, code });
+          scannedSetRef.current.add(m.id);
 
-          const c = corners.get(i);
-          const pts: { x: number; y: number }[] = [];
-          for (let j = 0; j < 4; j++) {
-            pts.push({ x: c.floatAt(0, j * 2), y: c.floatAt(0, j * 2 + 1) });
-          }
-
-          const isTarget = target.length === 2 && markerId === targetId;
+          const pts = m.corners.map((c) => ({
+            x: c.x * invScale,
+            y: c.y * invScale,
+          }));
+          const isTarget = target.length === 2 && m.id === targetId;
 
           ctx.beginPath();
           ctx.moveTo(pts[0].x, pts[0].y);
@@ -204,7 +143,8 @@ export default function Home() {
           }
 
           const cx = (pts[0].x + pts[2].x) / 2;
-          const fontSize = Math.max(14, Math.abs(pts[1].x - pts[0].x) * 0.5);
+          const edge = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+          const fontSize = Math.max(14, edge * 0.5);
           ctx.font = `bold ${fontSize}px 'JetBrains Mono', monospace`;
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
@@ -212,7 +152,8 @@ export default function Home() {
           const metrics = ctx.measureText(code);
           const pw = metrics.width + 12;
           const ph = fontSize + 8;
-          const labelY = pts[0].y - ph - 4;
+          const minY = Math.min(pts[0].y, pts[1].y, pts[2].y, pts[3].y);
+          const labelY = minY - ph - 4;
 
           ctx.fillStyle = isTarget ? "#22c55e" : "rgba(10,10,12,0.85)";
           ctx.beginPath();
@@ -221,8 +162,6 @@ export default function Home() {
 
           ctx.fillStyle = isTarget ? "#000" : "#fff";
           ctx.fillText(code, cx, labelY);
-
-          c.delete();
         }
 
         setDetected(frameDetected);
@@ -242,70 +181,50 @@ export default function Home() {
         console.error("Detection error:", e);
       }
 
-      corners.delete();
-      ids.delete();
-
       rafId = requestAnimationFrame(detectLoop);
-    };
-
-    const onOpenCvReady = () => {
-      if (cancelled) return;
-      initDetector();
-      setReady(true);
-      detectLoop();
     };
 
     const startCamera = async () => {
       setLoadingText("Starting camera...");
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: "environment",
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          },
-        });
-        video.srcObject = stream;
-        await video.play();
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-      } catch (err) {
-        setLoadingText("Camera access denied. Please allow camera.");
-        console.error(err);
-      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "environment",
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+      });
+      video.srcObject = stream;
+      await video.play();
     };
 
-    const loadOpenCv = () => {
-      setLoadingText("Loading OpenCV.js (may take a moment)...");
-      const script = document.createElement("script");
-      script.src = `${BASE_PATH}/opencv.js`;
-      script.async = true;
-      script.onload = () => {
-        const cv = window.cv;
-        if (!cv) {
-          setLoadingText("OpenCV.js loaded but cv is undefined.");
-          return;
-        }
-        if (cv.getBuildInformation) {
-          onOpenCvReady();
-        } else {
-          cv.onRuntimeInitialized = onOpenCvReady;
-        }
-      };
-      script.onerror = () => setLoadingText("Failed to load OpenCV.js.");
-      document.head.appendChild(script);
+    const loadDetector = async () => {
+      setLoadingText("Loading detector...");
+      await loadScript(`${BASE_PATH}/js-aruco2/cv.js`);
+      await loadScript(`${BASE_PATH}/js-aruco2/aruco.js`);
+      await loadScript(`${BASE_PATH}/js-aruco2/dictionaries/aruco_4x4_1000.js`);
+      if (!window.AR) throw new Error("AR global missing after load");
+      detector = new window.AR.Detector({ dictionaryName: "ARUCO_4X4_1000" });
     };
 
     (async () => {
-      await startCamera();
-      if (!cancelled) loadOpenCv();
+      try {
+        await startCamera();
+        if (cancelled) return;
+        await loadDetector();
+        if (cancelled) return;
+        setReady(true);
+        detectLoop();
+      } catch (err) {
+        console.error(err);
+        setLoadingText(
+          err instanceof Error ? err.message : "Failed to initialize.",
+        );
+      }
     })();
 
     return () => {
       cancelled = true;
       cancelAnimationFrame(rafId);
-      srcMat?.delete();
-      grayMat?.delete();
       const stream = video.srcObject as MediaStream | null;
       stream?.getTracks().forEach((t) => t.stop());
     };
